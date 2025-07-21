@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Super GPS Parlant Stable</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.css" />
+  <style>
+    body { font-family: 'Arial', sans-serif; margin: 0; padding: 0; background: #f5f5f5; }
+    #map { height: 100vh; width: 100%; }
+    #info, #instructions {
+      position: absolute; left: 20px;
+      background: rgba(255,255,255,0.97);
+      padding: 15px; font-size: 15px;
+      border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.13);
+      z-index: 999; width: 280px;
+    }
+    #info { top: 20px; }
+    #instructions { top: 100px; max-height: 350px; overflow-y: auto; }
+    #instructions ol { padding-left: 20px; }
+    .leaflet-routing-container {
+      background-color: rgba(0,0,0,0.85);
+      color: #fff;
+      border-radius: 10px;
+    }
+    .route-highlight {
+      background: #ffeb3b;
+      font-weight: bold;
+    }
+    #speaker-btn {
+      background: #ff5252; color: #fff;
+      border: none; border-radius: 5px;
+      padding: 8px 14px; margin: 6px 0 0;
+      cursor: pointer; font-size: 15px;
+      transition: background 0.3s;
+    }
+    #speaker-btn:hover { background: #ff1744; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <p><strong>Temps estimé:</strong> <span id="estimated-time">--</span></p>
+    <p><strong>Distance:</strong> <span id="distance">--</span> km</p>
+    <p><strong>Vitesse actuelle:</strong> <span id="speed">--</span> km/h</p>
+    <button id="speaker-btn">🔊 Répéter l'instruction</button>
+  </div>
+  <div id="instructions">
+    <strong>Instructions :</strong>
+    <ol id="inst-list"></ol>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.js"></script>
+  <script src="https://unpkg.com/leaflet-control-geocoder/dist/Control.Geocoder.js"></script>
+  <script>
+    let map, userMarker, userPosition, destinationMarker, routeControl, pathLine;
+    let path = [];
+    let destination = null;
+    let currentInstruction = '';
+    let lastSpokenStep = -1;
+    const speedWalking = 5; // km/h si vitesse non fournie
+
+    function speak(text) {
+      if ('speechSynthesis' in window && text) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = 'fr-FR';
+        utterance.rate = 1;
+        window.speechSynthesis.speak(utterance);
+      }
+    }
+
+    const routeLineStyles = [
+      { color: 'white', weight: 14, opacity: 1 },
+      { color: '#ff1744', weight: 8, opacity: 1 }
+    ];
+
+    function initMap() {
+      map = L.map('map').setView([48.8566, 2.3522], 13);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+      }).addTo(map);
+
+      userMarker = L.marker([48.8566, 2.3522]).addTo(map).bindPopup("Vous êtes ici").openPopup();
+
+      L.Control.geocoder().addTo(map);
+
+      trackPosition();
+
+      map.on('click', function(event) {
+        if (destination) map.removeLayer(destinationMarker);
+        destination = event.latlng;
+        destinationMarker = L.marker(destination).addTo(map).bindPopup("Destination").openPopup();
+        showRoute();
+      });
+
+      document.getElementById("speaker-btn").onclick = () => {
+        if (currentInstruction) speak(currentInstruction);
+      };
+    }
+
+    function trackPosition() {
+      if (navigator.geolocation) {
+        navigator.geolocation.watchPosition(updatePosition, handleError, {
+          enableHighAccuracy: true,
+          maximumAge: 1000,
+          timeout: 20000
+        });
+      } else {
+        alert("La géolocalisation n'est pas supportée par votre navigateur.");
+      }
+    }
+
+    function updatePosition(position) {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+
+      if (!userPosition) map.setView([lat, lon], 15);
+      userPosition = [lat, lon];
+      userMarker.setLatLng(userPosition);
+
+      path.push(userPosition);
+      if (pathLine) map.removeLayer(pathLine);
+      if (path.length > 1) {
+        pathLine = L.polyline(path, { color: '#0099ff', weight: 2, opacity: 0.5, dashArray: '4,8' }).addTo(map);
+      }
+
+      const speed = position.coords.speed ? position.coords.speed * 3.6 : 0;
+      document.getElementById("speed").textContent = speed.toFixed(2);
+
+      if (destination) showRoute();
+    }
+
+    // RouteControl n'est créé qu'une fois, puis on met à jour ses waypoints
+    function showRoute() {
+      if (!destination || !userPosition) return;
+      const distanceInMeters = map.distance(userPosition, destination);
+      const distanceInKm = distanceInMeters / 1000;
+      const estimatedTimeInMinutes = (distanceInKm / speedWalking) * 60;
+      document.getElementById("distance").textContent = distanceInKm.toFixed(2);
+      document.getElementById("estimated-time").textContent = estimatedTimeInMinutes.toFixed(2);
+
+      if (routeControl) {
+        // On met à jour les waypoints sans détruire le contrôle (plus de clignotement)
+        routeControl.setWaypoints([L.latLng(userPosition), L.latLng(destination)]);
+      } else {
+        routeControl = L.Routing.control({
+          waypoints: [L.latLng(userPosition), L.latLng(destination)],
+          routeWhileDragging: false,
+          language: 'fr',
+          show: false,
+          addWaypoints: false,
+          draggableWaypoints: false,
+          fitSelectedRoutes: true,
+          lineOptions: { styles: routeLineStyles },
+          createMarker: function() { return null; }
+        }).addTo(map);
+
+        routeControl.on('routesfound', function(e) {
+          displayInstructions(e.routes[0]);
+        });
+
+        // Pour mettre à jour les instructions à chaque changement de route, même quand on ne recrée pas le contrôle
+        routeControl.on('waypointschanged', function(e) {
+          // Après changement de waypoints, attendre le recalcul de route
+          setTimeout(() => {
+            if(routeControl._routes && routeControl._routes[0]) {
+              displayInstructions(routeControl._routes[0]);
+            }
+          }, 500);
+        });
+      }
+    }
+
+    function displayInstructions(route) {
+      let steps = [];
+      if (route.instructions) {
+        steps = route.instructions;
+      } else if (route.legs && route.legs.length > 0 && route.legs[0].steps) {
+        steps = route.legs[0].steps;
+      }
+
+      const instList = document.getElementById("inst-list");
+      instList.innerHTML = '';
+      steps.forEach(function(step, i) {
+        let instruction = renderInstruction(step);
+        const li = document.createElement("li");
+        li.textContent = instruction;
+        if (i === 0) li.classList.add('route-highlight');
+        instList.appendChild(li);
+      });
+
+      currentInstruction = steps[0] ? renderInstruction(steps[0]) : '';
+      lastSpokenStep = -1;
+      if (currentInstruction) speak(currentInstruction);
+      followNavigation(steps, route.coordinates);
+    }
+
+    function renderInstruction(step) {
+      if (!step) return '';
+      if (step.type && step.modifier) {
+        if (step.type === 'roundabout') {
+          return `Au rond-point, prenez la ${ordinalFr(step.exit)} sortie`;
+        } else if (step.modifier === 'left') {
+          return `Tournez à gauche dans ${Math.round(step.distance)} mètres`;
+        } else if (step.modifier === 'right') {
+          return `Tournez à droite dans ${Math.round(step.distance)} mètres`;
+        }
+      }
+      if (step.instruction) return step.instruction;
+      return '';
+    }
+
+    function ordinalFr(n) {
+      if (n === 1) return "1ère";
+      return n + "e";
+    }
+
+    function followNavigation(steps, routeCoords) {
+      if (!steps || steps.length === 0) return;
+      let watchId = navigator.geolocation.watchPosition(function(pos) {
+        const user = [pos.coords.latitude, pos.coords.longitude];
+        let closestIdx = 0;
+        let minDist = Infinity;
+        steps.forEach((step, i) => {
+          if (step.latLng) {
+            const d = map.distance(user, [step.latLng.lat, step.latLng.lng]);
+            if (d < minDist) {
+              minDist = d;
+              closestIdx = i;
+            }
+          }
+        });
+        if (closestIdx !== lastSpokenStep) {
+          currentInstruction = renderInstruction(steps[closestIdx]);
+          speak(currentInstruction);
+          highlightInstruction(closestIdx);
+          lastSpokenStep = closestIdx;
+        }
+      }, handleError, { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 });
+    }
+
+    function highlightInstruction(idx) {
+      let items = document.querySelectorAll("#inst-list li");
+      items.forEach((el, i) => {
+        if (i === idx) el.classList.add('route-highlight');
+        else el.classList.remove('route-highlight');
+      });
+    }
+
+    function handleError(error) {
+      console.warn(`ERROR(${error.code}): ${error.message}`);
+    }
+
+    initMap();
+  </script>
+</body>
+</html>
